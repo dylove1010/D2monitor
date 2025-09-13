@@ -4,129 +4,156 @@ import logging
 import requests
 from datetime import datetime
 from deep_translator import GoogleTranslator
-from bs4 import BeautifulSoup
-import hashlib
-import schedule
+from threading import Thread
+from flask import Flask
 
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("monitor.log"),
-        logging.StreamHandler()
-    ]
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-# 配置
-WEBSITE_URL = "https://d2emu.com/tz-china"
-WECHAT_WEBHOOK = os.getenv("WECHAT_WEBHOOK")
-CHECK_INTERVAL = 3600  # 检查间隔，单位：秒（1小时）
-PREVIOUS_CONTENT_HASH = None
+# 目标网站URL
+TARGET_URL = "https://d2emu.com/tz-china"
+# 检查间隔（小时）
+CHECK_INTERVAL = 1
+# 存储上次的网站内容
+last_content = None
+
+# 初始化Flask应用用于端口监听
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return "Website monitor is running", 200
+
+def run_flask():
+    """运行Flask服务器以提供端口监听"""
+    port = int(os.environ.get('PORT', 10000))  # 使用Render提供的端口或默认10000
+    app.run(host='0.0.0.0', port=port, debug=False)
 
 def get_website_content(url):
     """获取网站内容"""
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
         response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        # 提取文本内容并清理
-        text = soup.get_text(separator=' ', strip=True)
-        # 取前2000字符作为监控对象（避免内容过长）
-        return text[:2000]
+        response.raise_for_status()  # 抛出HTTP错误
+        return response.text
     except Exception as e:
         logging.error(f"获取网站内容失败: {str(e)}")
         return None
 
 def translate_to_chinese(text):
-    """将英文翻译为中文"""
+    """将英文文本翻译为中文"""
+    if not text:
+        return "无法获取内容进行翻译"
+    
     try:
-        if not text:
-            return "无内容可翻译"
-            
+        # 限制文本长度以避免翻译API错误
+        max_length = 5000
+        if len(text) > max_length:
+            text = text[:max_length] + "..."
+        
         translator = GoogleTranslator(source='en', target='zh-CN')
-        # 翻译可能有长度限制，分段翻译
+        # 处理长文本，分块翻译
         chunks = [text[i:i+5000] for i in range(0, len(text), 5000)]
         translated_chunks = [translator.translate(chunk) for chunk in chunks]
         return ''.join(translated_chunks)
     except Exception as e:
         logging.error(f"翻译失败: {str(e)}")
-        # 翻译失败时返回原始文本
-        return f"翻译失败，原始内容：{text[:500]}..."
+        return f"翻译服务出错: {str(e)}\n原文片段: {text[:200]}..."
 
 def send_to_wechat(content, is_update=True):
     """发送消息到企业微信"""
-    if not WECHAT_WEBHOOK:
-        logging.error("未配置企业微信Webhook")
+    webhook_url = os.environ.get('WECHAT_WEBHOOK')
+    if not webhook_url:
+        logging.error("未配置企业微信Webhook，请检查环境变量")
         return False
-        
+    
     try:
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 准备消息内容
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         title = "网站更新通知" if is_update else "网站当前内容"
         
         message = {
             "msgtype": "text",
             "text": {
-                "content": f"{title}\n时间: {current_time}\n网站: {WEBSITE_URL}\n内容: {content[:1000]}..."  # 限制长度
+                "content": f"{title}\n时间: {timestamp}\n网站: {TARGET_URL}\n\n{content[:2000]}  # 内容可能已截断"
             }
         }
         
-        response = requests.post(WECHAT_WEBHOOK, json=message, timeout=10)
+        response = requests.post(webhook_url, json=message, timeout=10)
         response.raise_for_status()
-        logging.info("消息已成功发送到企业微信")
-        return True
+        
+        result = response.json()
+        if result.get('errcode') == 0:
+            logging.info("消息成功推送到企业微信")
+            return True
+        else:
+            logging.error(f"企业微信推送失败: {result.get('errmsg')}")
+            return False
     except Exception as e:
-        logging.error(f"发送消息到企业微信失败: {str(e)}")
+        logging.error(f"发送消息失败: {str(e)}")
         return False
 
 def check_website_update():
-    """检查网站更新"""
-    global PREVIOUS_CONTENT_HASH
+    """检查网站更新并处理"""
+    global last_content
     
-    current_content = get_website_content(WEBSITE_URL)
+    current_content = get_website_content(TARGET_URL)
     if not current_content:
-        return
-        
-    # 计算内容哈希值
-    current_hash = hashlib.md5(current_content.encode()).hexdigest()
+        return False
     
-    # 首次运行或内容有变化
-    if PREVIOUS_CONTENT_HASH is None:
-        logging.info("首次运行，记录初始内容")
-        PREVIOUS_CONTENT_HASH = current_hash
-        # 首次运行时立即推送一次当前内容
-        translated_content = translate_to_chinese(current_content)
-        send_to_wechat(translated_content, is_update=False)
-    elif current_hash != PREVIOUS_CONTENT_HASH:
+    # 首次运行，记录内容并推送当前状态
+    if last_content is None:
+        last_content = current_content
+        logging.info("已记录初始网站内容")
+        
+        # 翻译内容
+        translated = translate_to_chinese(current_content)
+        
+        # 立即推送一次当前内容
+        send_to_wechat(translated, is_update=False)
+        return True
+    
+    # 检查内容是否有变化
+    if current_content != last_content:
         logging.info("检测到网站内容更新")
-        PREVIOUS_CONTENT_HASH = current_hash
-        translated_content = translate_to_chinese(current_content)
-        send_to_wechat(translated_content, is_update=True)
+        
+        # 翻译新内容
+        translated = translate_to_chinese(current_content)
+        
+        # 推送更新
+        send_to_wechat(translated, is_update=True)
+        
+        # 更新记录的内容
+        last_content = current_content
+        return True
     else:
         logging.info("网站内容未发生变化")
+        return False
 
-def main():
-    logging.info("网站监控程序启动")
+def monitor_website():
+    """监控网站的主循环"""
+    logging.info("网站更新监控程序启动")
     
-    # 立即执行一次检查（会触发首次推送）
+    # 立即检查一次
     check_website_update()
     
-    # 设置定时任务
-    schedule.every(CHECK_INTERVAL).seconds.do(check_website_update)
-    
-    # 保持程序运行
-    try:
-        while True:
-            schedule.run_pending()
-            time.sleep(60)  # 每分钟检查一次是否有定时任务需要执行
-    except KeyboardInterrupt:
-        logging.info("程序被用户终止")
-    except Exception as e:
-        logging.error(f"程序运行出错: {str(e)}")
+    # 定时检查
+    logging.info(f"定时任务已启动，将每{CHECK_INTERVAL}小时检查一次网站更新")
+    while True:
+        time.sleep(CHECK_INTERVAL * 3600)  # 转换为秒
+        check_website_update()
 
 if __name__ == "__main__":
-    main()
+    # 启动Flask线程用于端口监听
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    # 启动监控程序
+    monitor_website()
     
