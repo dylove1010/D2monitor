@@ -2,4 +2,6 @@ requests==2.32.3
 deep-translator==1.11.4
 python-dotenv==1.0.0
 flask==2.3.3
+beautifulsoup4==4.12.3  # 新增：HTML解析库
+lxml==5.2.1  # 新增：高效解析器
     
